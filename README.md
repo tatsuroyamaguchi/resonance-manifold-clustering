@@ -18,7 +18,7 @@ pip install -e .
 ### GitHubからの直接インストール
 リポジトリをGitHubにプッシュして公開した後は、以下のコマンドでどのPCからでも直接インストール可能です。
 ```bash
-pip install git+https://github.com/あなたのユーザー名/リポジトリ名.git
+pip install git+https://github.com/tatsuroyamaguchi/resonance-manifold-clustering.git
 ```
 
 ## 使い方 (Usage)
