@@ -1,0 +1,8 @@
+resonance_manifold_clustering.py
+rmc.py
+setup.py
+rmc_clustering.egg-info/PKG-INFO
+rmc_clustering.egg-info/SOURCES.txt
+rmc_clustering.egg-info/dependency_links.txt
+rmc_clustering.egg-info/requires.txt
+rmc_clustering.egg-info/top_level.txt
