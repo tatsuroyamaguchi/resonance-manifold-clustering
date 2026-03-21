@@ -23,7 +23,7 @@ pip install -e .
 ### GitHub からの直接インストール
 
 ```bash
-pip install git+https://github.com/あなたのユーザー名/リポジトリ名.git
+pip install git+https://github.com/tatsuroyamaguchi/resonance-manifold-clustering.git
 ```
 
 ## 使い方 (Usage)
