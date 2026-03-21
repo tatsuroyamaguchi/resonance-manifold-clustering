@@ -79,38 +79,37 @@ class ResonanceManifoldClustering:
 
     def _build_adjacency(self, X):
         """
-        局所的スケール調整（Local Scaling）手法を用いて結合グラフを構築する。
+        局所的スケール調整（Local Scaling）手法と k-NN グラフを組み合わせて結合グラフを構築する。
         各データ点 i について、k番目に近い点までの距離を独自のスケール sigma_i とし、
         結合の強さを exp(-d(i,j)^2 / (sigma_i * sigma_j)) で定義する。
-        これにより、データ全体のスケールや密度の偏りに自動で適応するため、
-        手動でのパラメータ調整がほぼ完全に不要となる。
+        さらに、k近傍に入らない遠い接続は完全に遮断（0）することで、無関係な多様体同士が同期するのを防ぐ。
+        これにより、手動でのパラメータチューニングなしで、複雑な形状のクラスタリングが自動化される。
         """
-        from sklearn.neighbors import NearestNeighbors
+        from sklearn.neighbors import kneighbors_graph
         
         n_neighbors = min(self.n_neighbors, X.shape[0] - 1)
         if n_neighbors < 1:
             n_neighbors = 1
             
-        # 各点の k 番目の近傍までの距離（sigma_i）を求める
-        nbrs = NearestNeighbors(n_neighbors=n_neighbors + 1).fit(X)
-        distances, _ = nbrs.kneighbors(X)
+        # 1. 各点の k 個の近傍グラフを作成し、距離を取得
+        adj_sparse = kneighbors_graph(X, n_neighbors=n_neighbors, mode='distance', include_self=False)
+        dists = adj_sparse.toarray()
         
-        # distances の 0番目は自身(0.0) なので、一番最後(-1)を使う
-        sigma = distances[:, -1]
+        # 2. 対称化（双方向に結合させる）
+        dists = np.maximum(dists, dists.T)
+        
+        # 3. 各点の k 番目の距離を sigma_i とする（各行の最大値が k 番目の近傍距離になる）
+        sigma = np.max(adj_sparse.toarray(), axis=1)
         sigma = np.maximum(sigma, 1e-10)  # 0除算防止
         
-        # 全成分の距離行列
-        dists = euclidean_distances(X, X)
-        
-        # Local Scaling
+        # 4. Local Scaling の適用（エッジが存在する dists > 0 の場所のみ計算）
         sigma_matrix = np.outer(sigma, sigma)
-        adj = np.exp(-dists ** 2 / sigma_matrix)
+        adj = np.zeros_like(dists)
+        mask = dists > 0
+        adj[mask] = np.exp(- (dists[mask] ** 2) / sigma_matrix[mask])
         
         # 自分自身との結合を消す
         np.fill_diagonal(adj, 0.0)
-        
-        # 計算効率とノイズ削減のため、十分に弱い結合をゼロにする（スパース化）
-        adj[adj < 1e-4] = 0.0
         
         return adj
 
