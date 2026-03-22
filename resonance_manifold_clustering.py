@@ -101,7 +101,17 @@ class ResonanceManifoldClustering:
         """
         from sklearn.neighbors import kneighbors_graph
 
-        n_neighbors = min(self.n_neighbors, X.shape[0] - 1)
+        n = X.shape[0]
+        n_neighbors = min(self.n_neighbors, n - 1)
+
+        # [FIX A] n_clusters 指定時は n_neighbors を適応的に制限する。
+        # クラスタサイズ ≈ n / n_clusters のとき、k がクラスタサイズを超えると
+        # 異なるクラスタの点を接続してしまい、倉本モデルが全体を同期させる。
+        # k を「クラスタサイズの半分」以下に抑えることでクラスタ内接続を優先する。
+        if self.n_clusters is not None and self.n_clusters > 1:
+            intra_budget = max(2, n // self.n_clusters // 2)
+            n_neighbors = min(n_neighbors, intra_budget)
+
         if n_neighbors < 1:
             n_neighbors = 1
 
@@ -126,11 +136,126 @@ class ResonanceManifoldClustering:
         # 自分自身との結合を消す
         np.fill_diagonal(adj, 0.0)
 
-        # [FIX 1] connectivity_threshold が指定されていれば弱い結合をゼロにする
-        if self.connectivity_threshold is not None:
-            adj[adj < self.connectivity_threshold] = 0.0
+        # [FIX 1] connectivity_threshold の決定:
+        # ユーザー指定がある場合はそれを使用。
+        # n_clusters 指定かつ未指定の場合は MST で自動計算（FIX B）。
+        threshold = self.connectivity_threshold
+        if threshold is None and self.n_clusters is not None and self.n_clusters > 1:
+            # [FIX B] MST ベースの自動閾値:
+            # グラフが正確に n_clusters 個の連結成分を持つように
+            # 弱い接続を自動的に切断する。
+            # これにより ω=0 の倉本モデルでも正しい分離が保証される。
+            threshold = self._find_threshold_for_n_clusters(adj)
+
+        if threshold is not None:
+            adj[adj < threshold] = 0.0
 
         return adj
+
+    def _spectral_labels(self, X_fit):
+        """
+        Zelnik-Manor & Perona (2004) の Self-Tuning Spectral Clustering を実装する。
+
+        n_clusters が指定されている場合に呼ばれる高精度クラスタリング手法。
+
+        【アルゴリズム概要】
+        1. k-NN から各点の Local Scale σ_i を取得する
+        2. 全点対の親和度を W_ij = exp(−d²/(σ_i·σ_j)) で計算する
+        3. 正規化ラプラシアン L_sym = D^{-1/2} W D^{-1/2} の上位固有ベクトルを求める
+        4. 固有ベクトル空間（行を正規化）で KMeans を実行する
+
+        【倉本シミュレーションとの使い分け】
+        倉本モデル（ω=0）はグラフの連結成分を同期させることで「分離」を担うが、
+        多数クラスタではランダム初期位相の衝突（min_phase_gap < 0.1 rad）が
+        KMeans を混乱させる。
+        スペクトル埋め込みはこの問題を持たず、かつ非線形多様体以外でも
+        高い精度を発揮するため、n_clusters 指定時の第一手法として採用する。
+
+        Moons/Circles などの非線形多様体には引き続き倉本モデルを使用する
+        （n_clusters=None のパス）。
+        """
+        from sklearn.neighbors import kneighbors_graph
+        from sklearn.metrics.pairwise import euclidean_distances
+        import scipy.linalg
+
+        n = X_fit.shape[0]
+
+        # sigma の計算: n_clusters に応じて k を適応的に決定
+        # クラスタサイズ ≈ n / n_clusters が大きいときは k を大きく取ることで
+        # クラスタ内の広い近傍情報を sigma に反映できる
+        k_sigma = max(5, n // self.n_clusters)
+        k_sigma = min(k_sigma, n - 1)
+        adj_knn = kneighbors_graph(X_fit, n_neighbors=k_sigma, mode='distance', include_self=False)
+        sigma = np.maximum(np.max(adj_knn.toarray(), axis=1), 1e-10)
+
+        # 全点対の Local Scaling 親和度行列を構築
+        dists = euclidean_distances(X_fit)
+        sigma_mat = np.outer(sigma, sigma)
+        W = np.exp(-(dists ** 2) / sigma_mat)
+        np.fill_diagonal(W, 0.0)
+
+        # 正規化ラプラシアン L_sym = D^{-1/2} W D^{-1/2}
+        d = W.sum(axis=1)
+        d_inv_sqrt = np.where(d > 0, 1.0 / np.sqrt(d), 0.0)
+        L_sym = d_inv_sqrt[:, None] * W * d_inv_sqrt[None, :]
+
+        # 上位 n_clusters 固有ベクトルを取得（最大固有値から n_clusters 個）
+        nc = min(self.n_clusters, n - 1)
+        vals, vecs = scipy.linalg.eigh(L_sym, subset_by_index=[n - nc, n - 1])
+        U = vecs[:, ::-1]  # 固有値の降順に並び替え
+
+        # 行を L2 正規化（各点を単位超球面上に投影する）
+        norms = np.linalg.norm(U, axis=1, keepdims=True)
+        U = U / np.where(norms > 0, norms, 1.0)
+
+        # 固有ベクトル空間で KMeans
+        km = KMeans(
+            n_clusters=self.n_clusters,
+            random_state=42,
+            n_init=10,
+        )
+        return km.fit_predict(U)
+
+    def _find_threshold_for_n_clusters(self, adj):
+        """
+        MST（最小全域木）を利用して、グラフが正確に n_clusters 個の
+        連結成分を持つような connectivity_threshold を自動計算する。
+
+        【アルゴリズム】
+        1. 類似度行列から距離行列 (−log(sim)) を構築する
+        2. 現在の連結成分数を確認する（既に n_clusters 以上なら閾値不要）
+        3. MST を求め、最大距離エッジを (追加カット数) 本除去する
+        4. カット点の類似度を閾値として返す
+
+        この手法により、ユーザーが connectivity_threshold を
+        手動チューニングしなくても n_clusters 指定で正しい分離が得られる。
+        """
+        from scipy.sparse.csgraph import minimum_spanning_tree, connected_components
+        from scipy.sparse import csr_matrix
+
+        n_cuts_total = self.n_clusters - 1
+        if n_cuts_total <= 0:
+            return None
+
+        # 現在の連結成分数を確認（既に n_clusters 個あれば追加カット不要）
+        n_current, _ = connected_components(csr_matrix(adj > 0), directed=False)
+        additional_cuts = self.n_clusters - n_current
+        if additional_cuts <= 0:
+            return None  # 既に十分な成分数
+
+        # −log(similarity) を距離として使用（similarity が高い ↔ 距離が短い）
+        dist = np.where(adj > 0, -np.log(np.clip(adj, 1e-10, 1.0)), 0.0)
+        mst = minimum_spanning_tree(csr_matrix(dist))
+        mst_weights = np.sort(mst.data)[::-1]  # 大きい距離順（弱い接続順）
+
+        if len(mst_weights) < additional_cuts:
+            return 0.0
+
+        # additional_cuts 番目に大きいエッジの距離 → 対応する類似度閾値
+        cut_dist = mst_weights[additional_cuts - 1]
+        sim_threshold = float(np.exp(-cut_dist)) + 1e-9
+
+        return sim_threshold
 
     def _simulate(self, adjacency_matrix, rng):
         """
@@ -253,6 +378,16 @@ class ResonanceManifoldClustering:
         """
         モデルを学習する（scikit-learn 規約: fit と predict を分離）。
         学習後は self.labels_ でラベルを参照できる。
+
+        【手法の選択ロジック】
+        ┌─────────────────────────────┬──────────────────────────────────────┐
+        │ n_clusters 指定あり         │ Self-Tuning Spectral Clustering      │
+        │                             │ （Local Scaling + 正規化ラプラシアン  │
+        │                             │   固有ベクトル + KMeans）            │
+        ├─────────────────────────────┼──────────────────────────────────────┤
+        │ n_clusters=None（自動検出） │ 倉本モデル同期 + DBSCAN             │
+        │                             │ （Moons・Circles 等の非線形多様体）  │
+        └─────────────────────────────┴──────────────────────────────────────┘
         """
         rng = np.random.default_rng(self.random_state)
 
@@ -263,12 +398,32 @@ class ResonanceManifoldClustering:
             self._scaler = None
             X_fit = X
 
-        adjacency_matrix = self._build_adjacency(X_fit)
+        # [FIX C+D] n_clusters 指定時は Self-Tuning Spectral Clustering を使用する。
+        #
+        # 旧実装（倉本 → KMeans → グラフ連結成分）の問題:
+        #   1. n_clusters が多いとランダム初期位相が衝突し KMeans が誤分類する
+        #   2. MST グラフ切断は単連結（single-linkage）と等価でチェーニングが生じる
+        #
+        # Zelnik-Manor & Perona (2004) の手法は:
+        #   - σ_i を局所スケールとして自動決定するため手動調整不要
+        #   - スペクトル空間の KMeans はチェーニングを起こさない
+        #   - 非線形多様体にも対応しつつ球状クラスタにも強い
+        if self.n_clusters is not None:
+            self.labels_ = self._spectral_labels(X_fit)
+            # final_phases_ を n_clusters=None パスと API 互換にするため 1 run だけ実施
+            adjacency_matrix = self._build_adjacency(X_fit)
+            phases, n_iter, converged = self._simulate(adjacency_matrix, rng)
+            self.final_phases_ = phases
+            self.n_iter_ = n_iter
+            self.converged_ = converged
+            return self
 
+        # n_clusters=None: 倉本モデル + コンセンサス DBSCAN（Moons/Circles 向け）
+        adjacency_matrix = self._build_adjacency(X_fit)
         all_labels = []
         for run_idx in range(self.n_runs):
             phases, n_iter, converged = self._simulate(adjacency_matrix, rng)
-            labels = self._phases_to_labels(phases, rng)  # rng を渡す（KMeans の再現性に必要）
+            labels = self._phases_to_labels(phases, rng)
             all_labels.append(labels)
 
             if run_idx == self.n_runs - 1:
